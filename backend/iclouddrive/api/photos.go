@@ -61,7 +61,68 @@ const (
 
 	// Slo-mo adjustment type (metadata-only edit, no separate rendered resource)
 	adjustSloMo = "com.apple.video.slomo"
+
+	// Apple-internal CloudKit Photos zone classes, identified by zoneID prefix
+	// Verified from cloudphotod symbols on macOS Sonoma 14.8.4:
+	//   CPLCloudKitLibraryZoneIdentification        => PrimarySync
+	//   CPLCloudKitLibraryShareZoneIdentification   => SharedSync-<UUID>
+	//   CPLCloudKitCMMZoneIdentification            => CMM-<UUID> (a.k.a. MomentShare,
+	//     internal name for legacy iCloud Shared Albums; records are cmm-share /
+	//     cmm-root, NOT CPLAlbum, so CPLAlbumByPositionLive is structurally absent
+	//     and returns BAD_REQUEST / "Index has invalid data")
+	primaryZoneName  = "PrimarySync"
+	sharedZonePrefix = "SharedSync-"
+	cmmZonePrefix    = "CMM-"
 )
+
+// libraryKind identifies the schema and capabilities of a CloudKit Photos zone
+type libraryKind int
+
+const (
+	libraryKindUnknown libraryKind = iota
+	libraryKindPrimary             // PrimarySync: own library, full album+asset schema
+	libraryKindShared              // SharedSync-*: Shared Photo Library (iOS 16.1+)
+	libraryKindCMM                 // CMM-*: iCloud Shared Album (legacy MomentShare); read not implemented
+)
+
+func classifyZone(zoneID string) libraryKind {
+	switch {
+	case zoneID == primaryZoneName:
+		return libraryKindPrimary
+	case strings.HasPrefix(zoneID, sharedZonePrefix):
+		return libraryKindShared
+	case strings.HasPrefix(zoneID, cmmZonePrefix):
+		return libraryKindCMM
+	default:
+		return libraryKindUnknown
+	}
+}
+
+func (k libraryKind) String() string {
+	switch k {
+	case libraryKindPrimary:
+		return "primary"
+	case libraryKindShared:
+		return "shared"
+	case libraryKindCMM:
+		return "cmm"
+	default:
+		return "unknown"
+	}
+}
+
+func libraryKindFromString(s string) libraryKind {
+	switch s {
+	case "primary":
+		return libraryKindPrimary
+	case "shared":
+		return libraryKindShared
+	case "cmm":
+		return libraryKindCMM
+	default:
+		return libraryKindUnknown
+	}
+}
 
 // utiExtensions maps common Apple UTI descriptors to file extensions
 // Used as fallback when filenameEnc is missing from a CPLMaster record
@@ -214,10 +275,11 @@ func deltaContainsAlbumChanges(records []json.RawMessage) bool {
 type Library struct {
 	service         *PhotosService
 	zoneID          string
-	area            string     // "private" or "shared" - determines API endpoint path
-	ownerRecordName string     // zone owner's _UUID for full zoneID in requests
-	zoneType        string     // "REGULAR_CUSTOM_ZONE" for full zoneID in requests
-	mu              sync.Mutex // protects albums map
+	kind            libraryKind // schema class derived from zoneID prefix
+	area            string      // "private" or "shared" - determines API endpoint path
+	ownerRecordName string      // zone owner's _UUID for full zoneID in requests
+	zoneType        string      // "REGULAR_CUSTOM_ZONE" for full zoneID in requests
+	mu              sync.Mutex  // protects albums map
 	albums          map[string]*Album
 	deltaMu         sync.Mutex    // serializes delta checks+apply; lock order: ps.mu before deltaMu
 	cacheValid      atomic.Bool   // true = album/photo disk caches are loadable
@@ -261,20 +323,6 @@ func (lib *Library) bufferDelta(records []json.RawMessage, syncToken string, mor
 // request makes an API call routed to this library's area (private or shared)
 func (lib *Library) request(ctx context.Context, endpoint string, data, response any) error {
 	return lib.service.requestForArea(ctx, lib.area, endpoint, data, response)
-}
-
-func (lib *Library) isSharedLibrary() bool {
-	return strings.HasPrefix(lib.zoneID, "SharedSync")
-}
-
-func isSharedAlbumIndexError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "HTTP error 400") &&
-		strings.Contains(msg, "BAD_REQUEST") &&
-		strings.Contains(msg, "Index has invalid data")
 }
 
 func isZoneNotFoundError(err error) bool {
@@ -488,6 +536,7 @@ func NewTestPhotosService(libs map[string]map[string]*Album) *PhotosService {
 		lib := &Library{
 			service: ps,
 			zoneID:  zoneName,
+			kind:    classifyZone(zoneName),
 			area:    areaPrivate,
 			albums:  make(map[string]*Album),
 		}
@@ -612,6 +661,7 @@ func (ps *PhotosService) discoverLibraries(ctx context.Context) (*libraryDiscove
 			result.libraries[name] = &Library{
 				service:         ps,
 				zoneID:          name,
+				kind:            classifyZone(name),
 				area:            area,
 				ownerRecordName: zone.ZoneID.OwnerRecordName,
 				zoneType:        zone.ZoneID.ZoneType,
@@ -670,11 +720,15 @@ type albumQueryResponse struct {
 }
 
 // cachedLibraryEntry stores zone metadata for disk cache persistence
+// Kind is serialized as a string so old caches (where Kind is missing) can be
+// distinguished from explicitly-recorded "unknown" classifications and
+// re-classified via classifyZone on load
 type cachedLibraryEntry struct {
 	ZoneName        string `json:"zoneName"`
 	Area            string `json:"area,omitempty"`
 	OwnerRecordName string `json:"ownerRecordName,omitempty"`
 	ZoneType        string `json:"zoneType,omitempty"`
+	Kind            string `json:"kind,omitempty"`
 }
 
 // loadCachedLibraries loads zone metadata from disk cache
@@ -696,9 +750,15 @@ func (ps *PhotosService) loadCachedLibraries() map[string]*Library {
 		if area == "" {
 			area = areaPrivate
 		}
+		kind := libraryKindFromString(entry.Kind)
+		if entry.Kind == "" {
+			// Old cache predating the kind field: derive from zoneID prefix
+			kind = classifyZone(entry.ZoneName)
+		}
 		libs[entry.ZoneName] = &Library{
 			service:         ps,
 			zoneID:          entry.ZoneName,
+			kind:            kind,
 			area:            area,
 			ownerRecordName: entry.OwnerRecordName,
 			zoneType:        entry.ZoneType,
@@ -717,6 +777,7 @@ func (ps *PhotosService) saveCachedLibraries() {
 			Area:            lib.area,
 			OwnerRecordName: lib.ownerRecordName,
 			ZoneType:        lib.zoneType,
+			Kind:            lib.kind.String(),
 		})
 	}
 	saveJSONCache(ps.client.CacheDir(), "libraries.json", entries)
@@ -726,6 +787,14 @@ func (ps *PhotosService) saveCachedLibraries() {
 func (lib *Library) GetAlbums(ctx context.Context) (map[string]*Album, error) {
 	lib.mu.Lock()
 	defer lib.mu.Unlock()
+
+	if lib.kind == libraryKindCMM {
+		// CMM zones carry MomentShare records (legacy iCloud Shared Albums),
+		// not the CPLAlbum/CPLAsset/CPLMaster schema this backend reads
+		// Surface the zone (so users see it exists) but expose no albums
+		fs.Debugf(nil, "iclouddrive photos: zone %s is an iCloud Shared Album (MomentShare) zone; album content is not exposed by this backend", lib.zoneID)
+		return map[string]*Album{}, nil
+	}
 
 	if len(lib.albums) > 0 {
 		return lib.albums, nil
@@ -758,7 +827,17 @@ func (lib *Library) GetAlbums(ctx context.Context) (map[string]*Album, error) {
 		}
 	}
 
-	// Add user albums and folders (paginated - CloudKit caps at 200 per page)
+	// Only PrimarySync stores user albums. SharedSync-* (Shared Photo Library)
+	// holds shared photos but no CPLAlbum records by Apple's design - albums
+	// for shared content live in the participant's PrimarySync. Unknown zone
+	// classes have an undocumented schema and are not probed speculatively
+	if lib.kind != libraryKindPrimary {
+		lib.albums = albums
+		lib.saveCachedAlbums()
+		return lib.albums, nil
+	}
+
+	// User albums and folders (paginated - CloudKit caps at 200 per page)
 	var allRecords []albumRecord
 	var continuationMarker string
 
@@ -775,13 +854,6 @@ func (lib *Library) GetAlbums(ctx context.Context) (map[string]*Album, error) {
 		var response albumQueryResponse
 
 		if err := lib.request(ctx, "records/query", query, &response); err != nil {
-			// SharedSync libraries return BAD_REQUEST / "Index has invalid data"
-			// on CPLAlbumByPositionLive in live probes, so fall back to smart
-			// albums there while surfacing PrimarySync failures directly
-			fs.Debugf(nil, "iclouddrive photos: user album query failed for zone %q: %v", lib.zoneID, err)
-			if lib.isSharedLibrary() && isSharedAlbumIndexError(err) {
-				return albums, nil
-			}
 			return nil, fmt.Errorf("query user albums for zone %q: %w", lib.zoneID, err)
 		}
 
@@ -1028,6 +1100,9 @@ func (ps *PhotosService) batchCheckForChanges(ctx context.Context, libs map[stri
 	// Group zones by area for separate API calls (private and shared use different endpoints)
 	byArea := make(map[string][]zoneEntry)
 	for _, lib := range libs {
+		if lib.kind == libraryKindCMM {
+			continue
+		}
 		lib.deltaMu.Lock()
 		hasPending := lib.pendingDelta != nil
 		lib.deltaMu.Unlock()
@@ -1596,6 +1671,9 @@ func (ps *PhotosService) GetLibraryAlbumCounts(ctx context.Context) (map[string]
 	}
 	byArea := make(map[string][]libEntry)
 	for name, lib := range ps.libraries {
+		if lib.kind == libraryKindCMM {
+			continue
+		}
 		byArea[lib.area] = append(byArea[lib.area], libEntry{name: name, lib: lib})
 	}
 	ps.mu.Unlock()

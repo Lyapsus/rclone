@@ -114,7 +114,7 @@ func TestGetPhotos_DoesNotServeStaleCacheOnPagedDeltaFailure(t *testing.T) {
 		}
 	})
 
-	lib := &Library{service: ps, zoneID: "PrimarySync", area: areaPrivate, albums: map[string]*Album{}}
+	lib := &Library{service: ps, zoneID: "PrimarySync", kind: libraryKindPrimary, area: areaPrivate, albums: map[string]*Album{}}
 	album := newUserAlbumForTest(lib, "Exported", "album-record")
 	lib.albums[album.Name] = album
 	album.saveDiskCache([]*Photo{{ID: "stale-id", Filename: "stale.jpg"}})
@@ -209,7 +209,7 @@ func TestGetLibraries_RefreshesInMemoryLibraries(t *testing.T) {
 	})
 
 	ps.libraries = map[string]*Library{
-		"PrimarySync": {service: ps, zoneID: "PrimarySync", area: areaPrivate, albums: make(map[string]*Album)},
+		"PrimarySync": {service: ps, zoneID: "PrimarySync", kind: libraryKindPrimary, area: areaPrivate, albums: make(map[string]*Album)},
 	}
 
 	libs, err := ps.GetLibraries(ctx)
@@ -322,7 +322,7 @@ func TestGetAlbums_RetriesAfterTransientUserAlbumQueryFailure(t *testing.T) {
 		})
 	})
 
-	lib := &Library{service: ps, zoneID: "PrimarySync", area: areaPrivate, albums: map[string]*Album{}}
+	lib := &Library{service: ps, zoneID: "PrimarySync", kind: libraryKindPrimary, area: areaPrivate, albums: map[string]*Album{}}
 	_, err := lib.GetAlbums(ctx)
 	assert.Error(t, err, "private library failure should surface as error")
 	albums, err := lib.GetAlbums(ctx)
@@ -331,11 +331,39 @@ func TestGetAlbums_RetriesAfterTransientUserAlbumQueryFailure(t *testing.T) {
 	assert.GreaterOrEqual(t, topQueries.Load(), int32(2), "second GetAlbums call must retry transient top-level failures")
 }
 
-func TestGetAlbums_SharedSyncQueryFailureReturnsSmartAlbumsOnly(t *testing.T) {
+func TestGetAlbums_NonPrimaryReturnsSmartAlbumsWithoutAPICall(t *testing.T) {
+	cases := []struct {
+		name   string
+		zoneID string
+		kind   libraryKind
+	}{
+		{name: "shared-library", zoneID: "SharedSync-test", kind: libraryKindShared},
+		{name: "unknown-zone", zoneID: "NewClass-test", kind: libraryKindUnknown},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setTestCacheDir(t)
+			ctx := context.Background()
+			var hits atomic.Int32
+			ps := newHTTPTestPhotosService(t, "albums-deterministic-"+tc.name, func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
+				http.Error(w, "non-primary zones must not query CPLAlbumByPositionLive", http.StatusInternalServerError)
+			})
+			lib := &Library{service: ps, zoneID: tc.zoneID, kind: tc.kind, area: areaPrivate, albums: map[string]*Album{}}
+			albums, err := lib.GetAlbums(ctx)
+			require.NoError(t, err)
+			assert.Contains(t, albums, "All Photos")
+			assert.NotContains(t, albums, "User Album")
+			assert.Equal(t, int32(0), hits.Load(), "non-primary zones must not attempt CPLAlbumByPositionLive (SharedSync has no CPLAlbum records by Apple's design; unknown classes have undocumented schema)")
+			assert.Equal(t, len(SmartAlbums), len(lib.albums), "non-primary smart-album result is the complete answer for this kind and must be cached")
+		})
+	}
+}
+
+func TestGetAlbums_PrimaryIndexAbsentReturnsError(t *testing.T) {
 	setTestCacheDir(t)
 	ctx := context.Background()
-
-	ps := newHTTPTestPhotosService(t, "albums-shared-fallback", func(w http.ResponseWriter, r *http.Request) {
+	ps := newHTTPTestPhotosService(t, "albums-primary-index-absent", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte(`{
@@ -345,27 +373,48 @@ func TestGetAlbums_SharedSyncQueryFailureReturnsSmartAlbumsOnly(t *testing.T) {
 			"error": "BAD_REQUEST"
 		}`))
 	})
-
-	lib := &Library{service: ps, zoneID: "SharedSync-test", area: areaPrivate, albums: map[string]*Album{}}
-	albums, err := lib.GetAlbums(ctx)
-	require.NoError(t, err)
-	assert.Contains(t, albums, "All Photos")
-	assert.NotContains(t, albums, "User Album")
-	assert.Empty(t, lib.albums, "SharedSync fallback should not cache partial album results")
+	lib := &Library{service: ps, zoneID: "PrimarySync", kind: libraryKindPrimary, area: areaPrivate, albums: map[string]*Album{}}
+	_, err := lib.GetAlbums(ctx)
+	assert.Error(t, err, "primary library must surface index-absent errors, never silently degrade")
 }
 
-func TestGetAlbums_SharedSyncUnexpectedFailureReturnsError(t *testing.T) {
+func TestGetAlbums_CMMReturnsEmptyWithoutAPICall(t *testing.T) {
 	setTestCacheDir(t)
 	ctx := context.Background()
-
-	ps := newHTTPTestPhotosService(t, "albums-shared-error", func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "unexpected shared failure", http.StatusInternalServerError)
+	var hits atomic.Int32
+	ps := newHTTPTestPhotosService(t, "albums-cmm-empty", func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.Error(w, "CMM zones must not be queried", http.StatusInternalServerError)
 	})
+	lib := &Library{service: ps, zoneID: "CMM-12345678-1234-1234-1234-123456789012", kind: libraryKindCMM, area: areaPrivate, albums: map[string]*Album{}}
+	albums, err := lib.GetAlbums(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, albums, "CMM zone must surface no albums (legacy MomentShare schema)")
+	assert.Equal(t, int32(0), hits.Load(), "CMM zone must short-circuit before any API call")
+}
 
-	lib := &Library{service: ps, zoneID: "SharedSync-test", area: areaPrivate, albums: map[string]*Album{}}
-	_, err := lib.GetAlbums(ctx)
-	assert.Error(t, err)
-	assert.Empty(t, lib.albums, "SharedSync unexpected failures must not cache partial album results")
+func TestClassifyZone(t *testing.T) {
+	cases := []struct {
+		zoneID string
+		want   libraryKind
+	}{
+		{"PrimarySync", libraryKindPrimary},
+		{"SharedSync-F86789F7-B1FB-411F-A3D2-DAC99DD61EE5", libraryKindShared},
+		{"CMM-4799B27A-3307-4C67-8CF3-A820E6275CFD", libraryKindCMM},
+		{"", libraryKindUnknown},
+		{"PrimarySyncOld", libraryKindUnknown},
+		{"FutureClass-12345", libraryKindUnknown},
+	}
+	for _, tc := range cases {
+		assert.Equal(t, tc.want, classifyZone(tc.zoneID), "classifyZone(%q)", tc.zoneID)
+	}
+}
+
+func TestLibraryKindRoundTripsViaCachedEntry(t *testing.T) {
+	for _, k := range []libraryKind{libraryKindPrimary, libraryKindShared, libraryKindCMM, libraryKindUnknown} {
+		assert.Equal(t, k, libraryKindFromString(k.String()), "round trip %v", k)
+	}
+	assert.Equal(t, libraryKindUnknown, libraryKindFromString(""), "missing kind in old caches must map to unknown for re-derivation via classifyZone")
 }
 
 func TestGetAlbums_RetriesAfterTransientFolderChildQueryFailure(t *testing.T) {
@@ -417,7 +466,7 @@ func TestGetAlbums_RetriesAfterTransientFolderChildQueryFailure(t *testing.T) {
 		}
 	})
 
-	lib := &Library{service: ps, zoneID: "PrimarySync", area: areaPrivate, albums: map[string]*Album{}}
+	lib := &Library{service: ps, zoneID: "PrimarySync", kind: libraryKindPrimary, area: areaPrivate, albums: map[string]*Album{}}
 	_, _ = lib.GetAlbums(ctx)
 	albums, err := lib.GetAlbums(ctx)
 	require.NoError(t, err)
@@ -1129,6 +1178,7 @@ func TestApplyPendingDelta_InvalidatesNestedAlbum(t *testing.T) {
 	lib := &Library{
 		service: ps,
 		zoneID:  "PrimarySync",
+		kind:    libraryKindPrimary,
 		area:    areaPrivate,
 		albums:  make(map[string]*Album),
 	}
@@ -1181,6 +1231,7 @@ func TestFlushCaches_NoPendingDeltaRace(t *testing.T) {
 	lib := &Library{
 		service: ps,
 		zoneID:  "PrimarySync",
+		kind:    libraryKindPrimary,
 		area:    areaPrivate,
 		albums:  make(map[string]*Album),
 	}

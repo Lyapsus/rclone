@@ -5,10 +5,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/lib/rest"
 
 	"golang.org/x/text/unicode/norm"
@@ -164,10 +167,19 @@ func (ps *PhotosService) getSharedAlbumPhotos(ctx context.Context, sa *SharedAlb
 }
 
 // parseSharedAlbumRecords converts sharedstreams CPLMaster records to Photos
+// Also matches CPLAsset metadata (favorites, hidden) when present
 // Returns photos and a recordName->downloadURL map for URL caching
 func parseSharedAlbumRecords(records []json.RawMessage, sa *SharedAlbum) ([]*Photo, map[string]string, error) {
 	var photos []*Photo
 	urls := make(map[string]string)
+
+	type assetMeta struct {
+		masterID   string
+		isFavorite bool
+		isHidden   bool
+	}
+	var assets []assetMeta
+
 	for _, raw := range records {
 		var rec struct {
 			RecordName string `json:"recordName"`
@@ -197,54 +209,86 @@ func parseSharedAlbumRecords(records []json.RawMessage, sa *SharedAlbum) ([]*Pho
 				OriginalCreationDate struct {
 					Value int64 `json:"value"`
 				} `json:"originalCreationDate"`
+				MasterRef struct {
+					Value struct {
+						RecordName string `json:"recordName"`
+					} `json:"value"`
+				} `json:"masterRef"`
+				IsFavorite struct {
+					Value int `json:"value"`
+				} `json:"isFavorite"`
+				IsHidden struct {
+					Value int `json:"value"`
+				} `json:"isHidden"`
 			} `json:"fields"`
 		}
 		if err := json.Unmarshal(raw, &rec); err != nil {
 			continue
 		}
-		if rec.RecordType != "CPLMaster" {
-			continue
-		}
 
-		var filename string
-		if rec.Fields.FilenameEnc.Value != "" {
-			if decoded, err := base64.StdEncoding.DecodeString(rec.Fields.FilenameEnc.Value); err == nil {
-				filename = norm.NFC.String(string(decoded))
+		switch rec.RecordType {
+		case "CPLMaster":
+			var filename string
+			if rec.Fields.FilenameEnc.Value != "" {
+				if decoded, err := base64.StdEncoding.DecodeString(rec.Fields.FilenameEnc.Value); err == nil {
+					filename = norm.NFC.String(string(decoded))
+				}
+			}
+			if filename == "" {
+				filename = rec.RecordName + ".jpg"
+			}
+
+			downloadURL := rec.Fields.ResOriginalRes.Value.DownloadURL
+			if downloadURL == "" {
+				downloadURL = rec.Fields.ResJPEGMedRes.Value.DownloadURL
+			}
+			if downloadURL == "" {
+				continue
+			}
+
+			size := rec.Fields.ResOriginalRes.Value.Size
+			if size == 0 {
+				size = -1
+			}
+
+			resourceInfo := sa.AlbumGUID + "|" + sa.SharingType + "|" + sa.Location
+			photos = append(photos, &Photo{
+				ID:          rec.RecordName,
+				Filename:    filename,
+				Size:        size,
+				AssetDate:   rec.Fields.OriginalCreationDate.Value,
+				AddedDate:   rec.Fields.OriginalCreationDate.Value,
+				Width:       rec.Fields.ResOriginalWidth.Value,
+				Height:      rec.Fields.ResOriginalHeight.Value,
+				ResourceKey: sharedstreamsResourcePrefix + resourceInfo,
+			})
+			urls[rec.RecordName] = downloadURL
+
+		case "CPLAsset":
+			masterID := rec.Fields.MasterRef.Value.RecordName
+			if masterID != "" {
+				assets = append(assets, assetMeta{
+					masterID:   masterID,
+					isFavorite: rec.Fields.IsFavorite.Value == 1,
+					isHidden:   rec.Fields.IsHidden.Value == 1,
+				})
 			}
 		}
-		if filename == "" {
-			filename = rec.RecordName + ".jpg"
-		}
-
-		downloadURL := rec.Fields.ResOriginalRes.Value.DownloadURL
-		if downloadURL == "" {
-			downloadURL = rec.Fields.ResJPEGMedRes.Value.DownloadURL
-		}
-		if downloadURL == "" {
-			continue
-		}
-
-		// Sharedstreams records report size=0 in resource fields;
-		// use -1 (unknown) so rclone skips the size check on transfer
-		size := rec.Fields.ResOriginalRes.Value.Size
-		if size == 0 {
-			size = -1
-		}
-
-		// Encode albumGUID + sharingType + albumLocation in ResourceKey for download routing
-		resourceInfo := sa.AlbumGUID + "|" + sa.SharingType + "|" + sa.Location
-		photos = append(photos, &Photo{
-			ID:          rec.RecordName,
-			Filename:    filename,
-			Size:        size,
-			AssetDate:   rec.Fields.OriginalCreationDate.Value,
-			AddedDate:   rec.Fields.OriginalCreationDate.Value,
-			Width:       rec.Fields.ResOriginalWidth.Value,
-			Height:      rec.Fields.ResOriginalHeight.Value,
-			ResourceKey: sharedstreamsResourcePrefix + resourceInfo,
-		})
-		urls[rec.RecordName] = downloadURL
 	}
+
+	if len(assets) > 0 {
+		byID := make(map[string]*Photo, len(photos))
+		for _, p := range photos {
+			byID[p.ID] = p
+		}
+		for _, a := range assets {
+			if p, ok := byID[a.masterID]; ok {
+				p.IsFavorite = a.isFavorite
+				p.IsHidden = a.isHidden
+			}
+		}
+	}
+
 	return photos, urls, nil
 }
 
@@ -335,12 +379,29 @@ func (album *Album) getSharedstreamsPhotos(ctx context.Context) ([]*Photo, error
 	album.mu.Unlock()
 
 	sa := albumToSharedAlbum(album)
+
+	cacheDir := album.lib.service.sharedstreamsCacheDir()
+	if sa.Ctag != "" {
+		if cached := loadSharedAlbumDiskCache(cacheDir, sa.AlbumGUID, sa.Ctag); cached != nil {
+			deduplicateFilenames(cached)
+			album.mu.Lock()
+			album.photoCache = buildPhotoCache(cached)
+			album.mu.Unlock()
+			fs.Debugf(nil, "iclouddrive photos: %d shared photos from cache for %s", len(cached), album.Name)
+			return cached, nil
+		}
+	}
+
 	photos, urls, err := album.lib.service.getSharedAlbumPhotos(ctx, sa)
 	if err != nil {
 		return nil, err
 	}
 	for id, url := range urls {
 		album.lib.service.ssURLs.Store(id, url)
+	}
+
+	if sa.Ctag != "" {
+		saveSharedAlbumDiskCache(cacheDir, sa.AlbumGUID, sa.Ctag, photos)
 	}
 
 	deduplicateFilenames(photos)
@@ -406,4 +467,88 @@ func (ps *PhotosService) buildSharedAlbumsForLibrary(ctx context.Context, lib *L
 		}
 	}
 	return albums, nil
+}
+
+// sharedstreamsCacheDir returns the disk cache directory for sharedstreams data
+func (ps *PhotosService) sharedstreamsCacheDir() string {
+	return filepath.Join(ps.client.CacheDir(), "sharedstreams")
+}
+
+type sharedAlbumDiskCache struct {
+	Ctag   string   `json:"ctag"`
+	Photos []*Photo `json:"photos"`
+}
+
+func loadSharedAlbumDiskCache(cacheDir, albumGUID, currentCtag string) []*Photo {
+	data, err := os.ReadFile(filepath.Join(cacheDir, albumGUID+".json"))
+	if err != nil {
+		return nil
+	}
+	var cache sharedAlbumDiskCache
+	if json.Unmarshal(data, &cache) != nil || cache.Ctag != currentCtag {
+		return nil
+	}
+	return cache.Photos
+}
+
+func saveSharedAlbumDiskCache(cacheDir, albumGUID, ctag string, photos []*Photo) {
+	saveJSONCache(cacheDir, albumGUID+".json", &sharedAlbumDiskCache{
+		Ctag:   ctag,
+		Photos: photos,
+	})
+}
+
+// pollSharedstreamsForChanges checks if any shared album ctags changed
+func (ps *PhotosService) pollSharedstreamsForChanges(ctx context.Context) bool {
+	ps.mu.Lock()
+	old := ps.sharedAlbums
+	ps.mu.Unlock()
+
+	if len(old) == 0 {
+		return false
+	}
+
+	fresh, err := ps.GetSharedAlbums(ctx)
+	if err != nil {
+		return false
+	}
+
+	if !sharedAlbumsChanged(old, fresh) {
+		return false
+	}
+
+	ps.mu.Lock()
+	ps.sharedAlbums = fresh
+	lib := ps.libraries["Shared Albums"]
+	ps.mu.Unlock()
+
+	if lib != nil {
+		lib.mu.Lock()
+		for _, album := range lib.albums {
+			album.mu.Lock()
+			album.photoCache = nil
+			album.mu.Unlock()
+		}
+		lib.albums = make(map[string]*Album)
+		lib.mu.Unlock()
+	}
+
+	fs.Debugf(nil, "iclouddrive photos: ChangeNotify detected changes in shared albums")
+	return true
+}
+
+func sharedAlbumsChanged(old, fresh []*SharedAlbum) bool {
+	if len(old) != len(fresh) {
+		return true
+	}
+	oldCtags := make(map[string]string, len(old))
+	for _, sa := range old {
+		oldCtags[sa.AlbumGUID] = sa.Ctag
+	}
+	for _, sa := range fresh {
+		if oldCtags[sa.AlbumGUID] != sa.Ctag {
+			return true
+		}
+	}
+	return false
 }

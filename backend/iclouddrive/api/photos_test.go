@@ -1444,6 +1444,79 @@ func TestResourceInfoToSharedAlbum(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestParseSharedAlbumRecordsCPLAssetMetadata(t *testing.T) {
+	records := []json.RawMessage{
+		json.RawMessage(`{
+			"recordName": "MASTER-1",
+			"recordType": "CPLMaster",
+			"fields": {
+				"filenameEnc": {"value": "` + base64.StdEncoding.EncodeToString([]byte("fav.jpg")) + `"},
+				"resOriginalRes": {"value": {"downloadURL": "https://cdn/fav.jpg", "size": 0}}
+			}
+		}`),
+		json.RawMessage(`{
+			"recordName": "ASSET-1",
+			"recordType": "CPLAsset",
+			"fields": {
+				"masterRef": {"value": {"recordName": "MASTER-1"}},
+				"isFavorite": {"value": 1},
+				"isHidden": {"value": 0}
+			}
+		}`),
+	}
+	sa := &SharedAlbum{AlbumGUID: "G", SharingType: "owned"}
+	photos, _, err := parseSharedAlbumRecords(records, sa)
+	require.NoError(t, err)
+	require.Len(t, photos, 1)
+	assert.True(t, photos[0].IsFavorite)
+	assert.False(t, photos[0].IsHidden)
+}
+
+func TestSharedAlbumDiskCache(t *testing.T) {
+	dir := t.TempDir()
+
+	photos := []*Photo{
+		{ID: "M1", Filename: "test.jpg", Size: -1, ResourceKey: "sharedstreams:G|owned|https://x/"},
+	}
+	saveSharedAlbumDiskCache(dir, "ALBUM-1", "ctag-v1", photos)
+
+	loaded := loadSharedAlbumDiskCache(dir, "ALBUM-1", "ctag-v1")
+	require.Len(t, loaded, 1)
+	assert.Equal(t, "M1", loaded[0].ID)
+	assert.Equal(t, "test.jpg", loaded[0].Filename)
+
+	stale := loadSharedAlbumDiskCache(dir, "ALBUM-1", "ctag-v2")
+	assert.Nil(t, stale)
+
+	missing := loadSharedAlbumDiskCache(dir, "NO-SUCH-ALBUM", "ctag-v1")
+	assert.Nil(t, missing)
+}
+
+func TestSharedAlbumsChanged(t *testing.T) {
+	old := []*SharedAlbum{
+		{AlbumGUID: "A", Ctag: "1"},
+		{AlbumGUID: "B", Ctag: "2"},
+	}
+	same := []*SharedAlbum{
+		{AlbumGUID: "A", Ctag: "1"},
+		{AlbumGUID: "B", Ctag: "2"},
+	}
+	assert.False(t, sharedAlbumsChanged(old, same))
+
+	updated := []*SharedAlbum{
+		{AlbumGUID: "A", Ctag: "1"},
+		{AlbumGUID: "B", Ctag: "3"},
+	}
+	assert.True(t, sharedAlbumsChanged(old, updated))
+
+	added := []*SharedAlbum{
+		{AlbumGUID: "A", Ctag: "1"},
+		{AlbumGUID: "B", Ctag: "2"},
+		{AlbumGUID: "C", Ctag: "1"},
+	}
+	assert.True(t, sharedAlbumsChanged(old, added))
+}
+
 func TestAlbumCacheKey(t *testing.T) {
 	k1 := albumCacheKey("CPLAssetByAssetDateWithoutHiddenOrDeleted")
 	k2 := albumCacheKey("CPLAssetInSmartAlbumByAssetDate:Video")

@@ -252,9 +252,10 @@ func (ps *PhotosService) FlushCaches() {
 		lib.deltaMu.Unlock()
 	}
 	ps.libraries = make(map[string]*Library)
-	ps.ssURLs = sync.Map{}
+	ps.sharedAlbums = nil
 	// Also remove the libraries cache file
 	_ = os.Remove(filepath.Join(ps.client.CacheDir(), "libraries.json"))
+	_ = os.RemoveAll(filepath.Join(ps.client.CacheDir(), "sharedstreams"))
 }
 
 // deltaPayload holds a buffered changes/zone response waiting to be applied
@@ -1259,6 +1260,9 @@ func (ps *PhotosService) PollForChanges(ctx context.Context) []string {
 			changed = append(changed, lib.zoneID)
 			fs.Debugf(nil, "iclouddrive photos: ChangeNotify detected changes in zone %s", lib.zoneID)
 		}
+	}
+	if ps.pollSharedstreamsForChanges(ctx) {
+		changed = append(changed, "Shared Albums")
 	}
 	return changed
 }

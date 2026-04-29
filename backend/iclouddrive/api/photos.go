@@ -224,6 +224,7 @@ type PhotosService struct {
 	mu           sync.Mutex
 	libraries    map[string]*Library
 	sharedAlbums []*SharedAlbum // cached sharedstreams discovery result
+	ssURLs       sync.Map       // sharedstreams recordName -> download URL cache
 }
 
 type libraryDiscovery struct {
@@ -251,6 +252,7 @@ func (ps *PhotosService) FlushCaches() {
 		lib.deltaMu.Unlock()
 	}
 	ps.libraries = make(map[string]*Library)
+	ps.ssURLs = sync.Map{}
 	// Also remove the libraries cache file
 	_ = os.Remove(filepath.Join(ps.client.CacheDir(), "libraries.json"))
 }

@@ -17,6 +17,7 @@ import (
 const (
 	sharedstreamsAlbumPrefix    = "sharedstreams:"
 	sharedstreamsResourcePrefix = "sharedstreams:"
+	sharedstreamsPageSize       = 200
 )
 
 // SharedAlbum represents a shared album from the sharedstreams API
@@ -125,31 +126,48 @@ func (ps *PhotosService) GetSharedAlbums(ctx context.Context) ([]*SharedAlbum, e
 	return albums, nil
 }
 
-// getSharedAlbumPhotos fetches photos from a shared album via webgetassets
-// Returns CPLMaster records with inline download URLs and filenames
-func (ps *PhotosService) getSharedAlbumPhotos(ctx context.Context, sa *SharedAlbum) ([]*Photo, error) {
+// fetchSharedAlbumRecords fetches all records from a shared album with pagination
+func (ps *PhotosService) fetchSharedAlbumRecords(ctx context.Context, sa *SharedAlbum) ([]json.RawMessage, error) {
 	reqURL := ps.sharedstreamsURL(sa, "webgetassets")
+	var allRecords []json.RawMessage
 
-	var response struct {
-		Records []json.RawMessage `json:"records"`
+	for offset := 0; ; offset += sharedstreamsPageSize {
+		var response struct {
+			Records []json.RawMessage `json:"records"`
+		}
+		body := map[string]any{
+			"albumguid": sa.AlbumGUID,
+			"offset":    fmt.Sprintf("%d", offset),
+			"limit":     fmt.Sprintf("%d", sharedstreamsPageSize),
+		}
+		if sa.Ctag != "" {
+			body["albumctag"] = sa.Ctag
+		}
+		if err := ps.sharedstreamsRequest(ctx, reqURL, body, &response); err != nil {
+			return nil, fmt.Errorf("sharedstreams webgetassets: %w", err)
+		}
+		if len(response.Records) == 0 {
+			break
+		}
+		allRecords = append(allRecords, response.Records...)
 	}
+	return allRecords, nil
+}
 
-	if err := ps.sharedstreamsRequest(ctx, reqURL, map[string]any{
-		"albumguid": sa.AlbumGUID,
-		"albumctag": sa.Ctag,
-		"offset":    "0",
-		"limit":     "200",
-	}, &response); err != nil {
-		return nil, fmt.Errorf("sharedstreams webgetassets: %w", err)
+// getSharedAlbumPhotos fetches photos from a shared album via webgetassets
+func (ps *PhotosService) getSharedAlbumPhotos(ctx context.Context, sa *SharedAlbum) ([]*Photo, map[string]string, error) {
+	records, err := ps.fetchSharedAlbumRecords(ctx, sa)
+	if err != nil {
+		return nil, nil, err
 	}
-
-	return parseSharedAlbumRecords(response.Records, sa)
+	return parseSharedAlbumRecords(records, sa)
 }
 
 // parseSharedAlbumRecords converts sharedstreams CPLMaster records to Photos
-// The records have the same schema as CloudKit CPLMaster but include inline downloadURLs
-func parseSharedAlbumRecords(records []json.RawMessage, sa *SharedAlbum) ([]*Photo, error) {
+// Returns photos and a recordName->downloadURL map for URL caching
+func parseSharedAlbumRecords(records []json.RawMessage, sa *SharedAlbum) ([]*Photo, map[string]string, error) {
 	var photos []*Photo
+	urls := make(map[string]string)
 	for _, raw := range records {
 		var rec struct {
 			RecordName string `json:"recordName"`
@@ -225,39 +243,30 @@ func parseSharedAlbumRecords(records []json.RawMessage, sa *SharedAlbum) ([]*Pho
 			Height:      rec.Fields.ResOriginalHeight.Value,
 			ResourceKey: sharedstreamsResourcePrefix + resourceInfo,
 		})
+		urls[rec.RecordName] = downloadURL
 	}
-	return photos, nil
+	return photos, urls, nil
 }
 
-// LookupSharedAlbumDownloadURL fetches a fresh download URL for a sharedstreams photo
+// LookupSharedAlbumDownloadURL returns a download URL for a sharedstreams photo,
+// using cached URLs from the initial listing when available
 func (ps *PhotosService) LookupSharedAlbumDownloadURL(ctx context.Context, recordName, resourceInfo, _ string) (string, error) {
-	info := strings.TrimPrefix(resourceInfo, sharedstreamsResourcePrefix)
-	parts := strings.SplitN(info, "|", 3)
-	if len(parts) != 3 {
-		return "", fmt.Errorf("invalid sharedstreams resource: %q", resourceInfo)
+	if url, ok := ps.ssURLs.Load(recordName); ok {
+		return url.(string), nil
 	}
 
-	sa := &SharedAlbum{
-		AlbumGUID:   parts[0],
-		SharingType: parts[1],
-		Location:    parts[2],
+	sa, err := resourceInfoToSharedAlbum(resourceInfo)
+	if err != nil {
+		return "", err
 	}
 
-	reqURL := ps.sharedstreamsURL(sa, "webgetassets")
-
-	var response struct {
-		Records []json.RawMessage `json:"records"`
+	records, err := ps.fetchSharedAlbumRecords(ctx, sa)
+	if err != nil {
+		return "", err
 	}
 
-	if err := ps.sharedstreamsRequest(ctx, reqURL, map[string]any{
-		"albumguid": sa.AlbumGUID,
-		"offset":    "0",
-		"limit":     "200",
-	}, &response); err != nil {
-		return "", fmt.Errorf("sharedstreams webgetassets: %w", err)
-	}
-
-	for _, raw := range response.Records {
+	var result string
+	for _, raw := range records {
 		var rec struct {
 			RecordName string `json:"recordName"`
 			RecordType string `json:"recordType"`
@@ -274,17 +283,37 @@ func (ps *PhotosService) LookupSharedAlbumDownloadURL(ctx context.Context, recor
 				} `json:"resJPEGMedRes"`
 			} `json:"fields"`
 		}
-		if json.Unmarshal(raw, &rec) != nil || rec.RecordName != recordName {
+		if json.Unmarshal(raw, &rec) != nil || rec.RecordType != "CPLMaster" {
 			continue
 		}
-		if url := rec.Fields.ResOriginalRes.Value.DownloadURL; url != "" {
-			return url, nil
+		url := rec.Fields.ResOriginalRes.Value.DownloadURL
+		if url == "" {
+			url = rec.Fields.ResJPEGMedRes.Value.DownloadURL
 		}
-		if url := rec.Fields.ResJPEGMedRes.Value.DownloadURL; url != "" {
-			return url, nil
+		if url != "" {
+			ps.ssURLs.Store(rec.RecordName, url)
+			if rec.RecordName == recordName {
+				result = url
+			}
 		}
 	}
-	return "", fmt.Errorf("record %q not found in shared album %q", recordName, sa.AlbumGUID)
+	if result == "" {
+		return "", fmt.Errorf("record %q not found in shared album %q", recordName, sa.AlbumGUID)
+	}
+	return result, nil
+}
+
+func resourceInfoToSharedAlbum(resourceInfo string) (*SharedAlbum, error) {
+	info := strings.TrimPrefix(resourceInfo, sharedstreamsResourcePrefix)
+	parts := strings.SplitN(info, "|", 3)
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("invalid sharedstreams resource: %q", resourceInfo)
+	}
+	return &SharedAlbum{
+		AlbumGUID:   parts[0],
+		SharingType: parts[1],
+		Location:    parts[2],
+	}, nil
 }
 
 // IsSharedstreamsResource returns true if the resourceKey indicates a sharedstreams photo
@@ -306,9 +335,12 @@ func (album *Album) getSharedstreamsPhotos(ctx context.Context) ([]*Photo, error
 	album.mu.Unlock()
 
 	sa := albumToSharedAlbum(album)
-	photos, err := album.lib.service.getSharedAlbumPhotos(ctx, sa)
+	photos, urls, err := album.lib.service.getSharedAlbumPhotos(ctx, sa)
 	if err != nil {
 		return nil, err
+	}
+	for id, url := range urls {
+		album.lib.service.ssURLs.Store(id, url)
 	}
 
 	deduplicateFilenames(photos)
@@ -344,6 +376,15 @@ func (ps *PhotosService) buildSharedAlbumsForLibrary(ctx context.Context, lib *L
 		return map[string]*Album{}, nil
 	}
 
+	nameCounts := make(map[string]int, len(sharedAlbums))
+	for _, sa := range sharedAlbums {
+		name := sa.Name
+		if name == "" {
+			name = sa.AlbumGUID
+		}
+		nameCounts[path.Base(name)]++
+	}
+
 	albums := make(map[string]*Album, len(sharedAlbums))
 	for _, sa := range sharedAlbums {
 		name := sa.Name
@@ -351,14 +392,16 @@ func (ps *PhotosService) buildSharedAlbumsForLibrary(ctx context.Context, lib *L
 			name = sa.AlbumGUID
 		}
 		name = path.Base(name)
+		if nameCounts[name] > 1 {
+			name = name + "_" + sa.AlbumGUID
+		}
 
-		// Encode album identity in ObjectType for later retrieval
 		objectType := sharedstreamsAlbumPrefix + sa.AlbumGUID + "|" + sa.SharingType + "|" + sa.Location
 
 		albums[name] = &Album{
 			Name:       name,
 			ObjectType: objectType,
-			Direction:  sa.Ctag, // store albumctag for webgetassets
+			Direction:  sa.Ctag,
 			lib:        lib,
 		}
 	}

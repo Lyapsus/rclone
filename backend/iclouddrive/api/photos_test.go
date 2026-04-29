@@ -1344,7 +1344,7 @@ func TestParseSharedAlbumRecords(t *testing.T) {
 	}
 
 	sa := &SharedAlbum{AlbumGUID: "GUID-1", SharingType: "owned", Location: "https://x/"}
-	photos, err := parseSharedAlbumRecords(records, sa)
+	photos, urls, err := parseSharedAlbumRecords(records, sa)
 	require.NoError(t, err)
 	require.Len(t, photos, 1)
 	assert.Equal(t, "MASTER-1", photos[0].ID)
@@ -1354,6 +1354,7 @@ func TestParseSharedAlbumRecords(t *testing.T) {
 	assert.Equal(t, 1080, photos[0].Height)
 	assert.True(t, IsSharedstreamsResource(photos[0].ResourceKey))
 	assert.Contains(t, photos[0].ResourceKey, "GUID-1")
+	assert.Equal(t, "https://cdn/sunset.jpg", urls["MASTER-1"])
 }
 
 func TestParseSharedAlbumRecordsNoDownloadURL(t *testing.T) {
@@ -1361,9 +1362,10 @@ func TestParseSharedAlbumRecordsNoDownloadURL(t *testing.T) {
 		json.RawMessage(`{"recordName": "X", "recordType": "CPLMaster", "fields": {}}`),
 	}
 	sa := &SharedAlbum{AlbumGUID: "G"}
-	photos, err := parseSharedAlbumRecords(records, sa)
+	photos, urls, err := parseSharedAlbumRecords(records, sa)
 	require.NoError(t, err)
 	assert.Empty(t, photos)
+	assert.Empty(t, urls)
 }
 
 func TestIsSharedstreamsResource(t *testing.T) {
@@ -1397,6 +1399,49 @@ func TestGetAlbums_SharedstreamsLibrary(t *testing.T) {
 	assert.True(t, strings.HasPrefix(vacation.ObjectType, sharedstreamsAlbumPrefix))
 	assert.Contains(t, vacation.ObjectType, "GUID-1")
 	assert.Contains(t, vacation.ObjectType, "owned")
+}
+
+func TestBuildSharedAlbumsDeduplicatesCollisions(t *testing.T) {
+	setTestCacheDir(t)
+	ctx := context.Background()
+
+	ps := newHTTPTestPhotosService(t, "dedup-test", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	})
+
+	ps.sharedAlbums = []*SharedAlbum{
+		{AlbumGUID: "AAA", Name: "Vacation", SharingType: "owned", Location: "https://a/"},
+		{AlbumGUID: "BBB", Name: "Vacation", SharingType: "subscribed", Location: "https://b/"},
+		{AlbumGUID: "CCC", Name: "Unique", SharingType: "owned", Location: "https://c/"},
+	}
+
+	lib := &Library{service: ps, zoneID: "Shared Albums", kind: libraryKindSharedstreams, area: areaPrivate, albums: map[string]*Album{}}
+	albums, err := lib.GetAlbums(ctx)
+	require.NoError(t, err)
+	assert.Len(t, albums, 3)
+	assert.Contains(t, albums, "Vacation_AAA")
+	assert.Contains(t, albums, "Vacation_BBB")
+	assert.Contains(t, albums, "Unique")
+}
+
+func TestSharedAlbumURLCache(t *testing.T) {
+	ps := &PhotosService{}
+	ps.ssURLs.Store("REC-1", "https://cdn/photo1.jpg")
+
+	url, err := ps.LookupSharedAlbumDownloadURL(context.Background(), "REC-1", "sharedstreams:G|owned|https://x/", "")
+	require.NoError(t, err)
+	assert.Equal(t, "https://cdn/photo1.jpg", url)
+}
+
+func TestResourceInfoToSharedAlbum(t *testing.T) {
+	sa, err := resourceInfoToSharedAlbum("sharedstreams:GUID-1|owned|https://example.com/")
+	require.NoError(t, err)
+	assert.Equal(t, "GUID-1", sa.AlbumGUID)
+	assert.Equal(t, "owned", sa.SharingType)
+	assert.Equal(t, "https://example.com/", sa.Location)
+
+	_, err = resourceInfoToSharedAlbum("bad-format")
+	assert.Error(t, err)
 }
 
 func TestAlbumCacheKey(t *testing.T) {

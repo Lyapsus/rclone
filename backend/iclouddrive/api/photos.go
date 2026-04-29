@@ -79,10 +79,11 @@ const (
 type libraryKind int
 
 const (
-	libraryKindUnknown libraryKind = iota
-	libraryKindPrimary             // PrimarySync: own library, full album+asset schema
-	libraryKindShared              // SharedSync-*: Shared Photo Library (iOS 16.1+)
-	libraryKindCMM                 // CMM-*: iCloud Shared Album (legacy MomentShare); read not implemented
+	libraryKindUnknown       libraryKind = iota
+	libraryKindPrimary                   // PrimarySync: own library, full album+asset schema
+	libraryKindShared                    // SharedSync-*: Shared Photo Library (iOS 16.1+)
+	libraryKindCMM                       // CMM-*: iCloud Shared Album (legacy MomentShare); metadata-only in CloudKit
+	libraryKindSharedstreams             // synthetic: unified view of all shared albums via sharedstreams API
 )
 
 func classifyZone(zoneID string) libraryKind {
@@ -106,6 +107,8 @@ func (k libraryKind) String() string {
 		return "shared"
 	case libraryKindCMM:
 		return "cmm"
+	case libraryKindSharedstreams:
+		return "sharedstreams"
 	default:
 		return "unknown"
 	}
@@ -119,6 +122,8 @@ func libraryKindFromString(s string) libraryKind {
 		return libraryKindShared
 	case "cmm":
 		return libraryKindCMM
+	case "sharedstreams":
+		return libraryKindSharedstreams
 	default:
 		return libraryKindUnknown
 	}
@@ -212,12 +217,13 @@ type ShouldRetryFunc func(ctx context.Context, resp *http.Response, err error) (
 
 // PhotosService manages iCloud Photos API interactions
 type PhotosService struct {
-	client      *Client
-	endpoint    string
-	pacer       *fs.Pacer
-	shouldRetry ShouldRetryFunc
-	mu          sync.Mutex
-	libraries   map[string]*Library
+	client       *Client
+	endpoint     string
+	pacer        *fs.Pacer
+	shouldRetry  ShouldRetryFunc
+	mu           sync.Mutex
+	libraries    map[string]*Library
+	sharedAlbums []*SharedAlbum // cached sharedstreams discovery result
 }
 
 type libraryDiscovery struct {
@@ -654,6 +660,12 @@ func (ps *PhotosService) discoverLibraries(ctx context.Context) (*libraryDiscove
 				continue
 			}
 			name := zone.ZoneID.ZoneName
+			kind := classifyZone(name)
+			// CMM zones are metadata-only CloudKit bookmarks; actual shared album
+			// content is served by the "Shared Albums" library via sharedstreams API
+			if kind == libraryKindCMM {
+				continue
+			}
 			// SharedSync-* found in private takes precedence over shared
 			if _, exists := result.libraries[name]; exists {
 				continue
@@ -661,7 +673,7 @@ func (ps *PhotosService) discoverLibraries(ctx context.Context) (*libraryDiscove
 			result.libraries[name] = &Library{
 				service:         ps,
 				zoneID:          name,
-				kind:            classifyZone(name),
+				kind:            kind,
 				area:            area,
 				ownerRecordName: zone.ZoneID.OwnerRecordName,
 				zoneType:        zone.ZoneID.ZoneType,
@@ -669,6 +681,19 @@ func (ps *PhotosService) discoverLibraries(ctx context.Context) (*libraryDiscove
 			}
 		}
 	}
+
+	if albums, err := ps.GetSharedAlbums(ctx); err == nil && len(albums) > 0 {
+		ps.sharedAlbums = albums
+		const sharedAlbumsLibName = "Shared Albums"
+		result.libraries[sharedAlbumsLibName] = &Library{
+			service: ps,
+			zoneID:  sharedAlbumsLibName,
+			kind:    libraryKindSharedstreams,
+			area:    areaPrivate,
+			albums:  make(map[string]*Album),
+		}
+	}
+
 	return result, nil
 }
 
@@ -755,6 +780,11 @@ func (ps *PhotosService) loadCachedLibraries() map[string]*Library {
 			// Old cache predating the kind field: derive from zoneID prefix
 			kind = classifyZone(entry.ZoneName)
 		}
+		// CMM zones are metadata-only bookmarks; skip them from cache
+		// (content served via "Shared Albums" sharedstreams library)
+		if kind == libraryKindCMM {
+			continue
+		}
 		libs[entry.ZoneName] = &Library{
 			service:         ps,
 			zoneID:          entry.ZoneName,
@@ -788,12 +818,13 @@ func (lib *Library) GetAlbums(ctx context.Context) (map[string]*Album, error) {
 	lib.mu.Lock()
 	defer lib.mu.Unlock()
 
-	if lib.kind == libraryKindCMM {
-		// CMM zones carry MomentShare records (legacy iCloud Shared Albums),
-		// not the CPLAlbum/CPLAsset/CPLMaster schema this backend reads
-		// Surface the zone (so users see it exists) but expose no albums
-		fs.Debugf(nil, "iclouddrive photos: zone %s is an iCloud Shared Album (MomentShare) zone; album content is not exposed by this backend", lib.zoneID)
-		return map[string]*Album{}, nil
+	if lib.kind == libraryKindSharedstreams {
+		albums, err := lib.service.buildSharedAlbumsForLibrary(ctx, lib)
+		if err != nil {
+			return nil, fmt.Errorf("sharedstreams: %w", err)
+		}
+		lib.albums = albums
+		return lib.albums, nil
 	}
 
 	if len(lib.albums) > 0 {
@@ -1100,7 +1131,7 @@ func (ps *PhotosService) batchCheckForChanges(ctx context.Context, libs map[stri
 	// Group zones by area for separate API calls (private and shared use different endpoints)
 	byArea := make(map[string][]zoneEntry)
 	for _, lib := range libs {
-		if lib.kind == libraryKindCMM {
+		if lib.kind == libraryKindSharedstreams {
 			continue
 		}
 		lib.deltaMu.Lock()
@@ -1671,7 +1702,7 @@ func (ps *PhotosService) GetLibraryAlbumCounts(ctx context.Context) (map[string]
 	}
 	byArea := make(map[string][]libEntry)
 	for name, lib := range ps.libraries {
-		if lib.kind == libraryKindCMM {
+		if lib.kind == libraryKindSharedstreams {
 			continue
 		}
 		byArea[lib.area] = append(byArea[lib.area], libEntry{name: name, lib: lib})
@@ -2171,6 +2202,11 @@ func (album *Album) GetPhotos(ctx context.Context) ([]*Photo, error) {
 		return result, nil
 	}
 
+	// Sharedstreams albums use a completely different API
+	if strings.HasPrefix(album.ObjectType, sharedstreamsAlbumPrefix) {
+		return album.getSharedstreamsPhotos(ctx)
+	}
+
 	// Check for changes, apply any buffered delta, serve from cache
 	if album.ObjectType != "" {
 		album.lib.checkForChanges(ctx)
@@ -2308,6 +2344,12 @@ func (ps *PhotosService) resolveZone(zoneName string) (area string, zoneID map[s
 // resourceKey selects which resource to look up (e.g. "resOriginalRes",
 // "resOriginalVidComplRes" for Live Photo video, "resJPEGFullRes" for edited)
 func (ps *PhotosService) LookupDownloadURL(ctx context.Context, recordName, zone, resourceKey string) (string, error) {
+	// Sharedstreams photos use a different download mechanism
+	if IsSharedstreamsResource(resourceKey) {
+		// zone contains the albumLocation URL for sharedstreams albums
+		return ps.LookupSharedAlbumDownloadURL(ctx, recordName, resourceKey, zone)
+	}
+
 	area, zoneID := ps.resolveZone(zone)
 
 	query := map[string]any{

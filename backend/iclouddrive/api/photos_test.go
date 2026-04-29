@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -376,21 +377,6 @@ func TestGetAlbums_PrimaryIndexAbsentReturnsError(t *testing.T) {
 	lib := &Library{service: ps, zoneID: "PrimarySync", kind: libraryKindPrimary, area: areaPrivate, albums: map[string]*Album{}}
 	_, err := lib.GetAlbums(ctx)
 	assert.Error(t, err, "primary library must surface index-absent errors, never silently degrade")
-}
-
-func TestGetAlbums_CMMReturnsEmptyWithoutAPICall(t *testing.T) {
-	setTestCacheDir(t)
-	ctx := context.Background()
-	var hits atomic.Int32
-	ps := newHTTPTestPhotosService(t, "albums-cmm-empty", func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
-		http.Error(w, "CMM zones must not be queried", http.StatusInternalServerError)
-	})
-	lib := &Library{service: ps, zoneID: "CMM-12345678-1234-1234-1234-123456789012", kind: libraryKindCMM, area: areaPrivate, albums: map[string]*Album{}}
-	albums, err := lib.GetAlbums(ctx)
-	require.NoError(t, err)
-	assert.Empty(t, albums, "CMM zone must surface no albums (legacy MomentShare schema)")
-	assert.Equal(t, int32(0), hits.Load(), "CMM zone must short-circuit before any API call")
 }
 
 func TestClassifyZone(t *testing.T) {
@@ -1318,6 +1304,99 @@ func TestAtomicWriteFile(t *testing.T) {
 	// No .tmp file left behind
 	_, err = os.Stat(target + ".tmp")
 	assert.True(t, os.IsNotExist(err), "temp file should not persist")
+}
+
+func TestGetDSID(t *testing.T) {
+	session := NewSession()
+	session.Cookies = []*http.Cookie{
+		{Name: "X-APPLE-WEBAUTH-TOKEN", Value: "v=2:t=EQ==BST"},
+		{Name: "X-APPLE-WEBAUTH-USER", Value: "v=1:s=1:d=16769155984"},
+		{Name: "X-APPLE-WEBAUTH-HSA-TRUST", Value: "some-trust-value"},
+	}
+	ps := &PhotosService{client: &Client{Session: session}}
+
+	assert.Equal(t, "16769155984", ps.getDSID())
+}
+
+func TestGetDSIDMissing(t *testing.T) {
+	session := NewSession()
+	session.Cookies = []*http.Cookie{
+		{Name: "X-APPLE-WEBAUTH-TOKEN", Value: "v=2:t=EQ==BST"},
+	}
+	ps := &PhotosService{client: &Client{Session: session}}
+	assert.Equal(t, "", ps.getDSID())
+}
+
+func TestParseSharedAlbumRecords(t *testing.T) {
+	records := []json.RawMessage{
+		json.RawMessage(`{
+			"recordName": "MASTER-1",
+			"recordType": "CPLMaster",
+			"fields": {
+				"filenameEnc": {"value": "` + base64.StdEncoding.EncodeToString([]byte("sunset.jpg")) + `", "type": "BYTES"},
+				"resOriginalRes": {"value": {"downloadURL": "https://cdn/sunset.jpg", "size": 5000}, "type": "ASSETID"},
+				"resOriginalWidth": {"value": 1920},
+				"resOriginalHeight": {"value": 1080},
+				"originalCreationDate": {"value": 1700000000000}
+			}
+		}`),
+		json.RawMessage(`{"recordName": "ASSET-1", "recordType": "CPLAsset", "fields": {}}`),
+	}
+
+	sa := &SharedAlbum{AlbumGUID: "GUID-1", SharingType: "owned", Location: "https://x/"}
+	photos, err := parseSharedAlbumRecords(records, sa)
+	require.NoError(t, err)
+	require.Len(t, photos, 1)
+	assert.Equal(t, "MASTER-1", photos[0].ID)
+	assert.Equal(t, "sunset.jpg", photos[0].Filename)
+	assert.Equal(t, int64(5000), photos[0].Size)
+	assert.Equal(t, 1920, photos[0].Width)
+	assert.Equal(t, 1080, photos[0].Height)
+	assert.True(t, IsSharedstreamsResource(photos[0].ResourceKey))
+	assert.Contains(t, photos[0].ResourceKey, "GUID-1")
+}
+
+func TestParseSharedAlbumRecordsNoDownloadURL(t *testing.T) {
+	records := []json.RawMessage{
+		json.RawMessage(`{"recordName": "X", "recordType": "CPLMaster", "fields": {}}`),
+	}
+	sa := &SharedAlbum{AlbumGUID: "G"}
+	photos, err := parseSharedAlbumRecords(records, sa)
+	require.NoError(t, err)
+	assert.Empty(t, photos)
+}
+
+func TestIsSharedstreamsResource(t *testing.T) {
+	assert.True(t, IsSharedstreamsResource("sharedstreams:GUID|owned|https://x/"))
+	assert.False(t, IsSharedstreamsResource("resOriginalRes"))
+	assert.False(t, IsSharedstreamsResource(""))
+}
+
+func TestGetAlbums_SharedstreamsLibrary(t *testing.T) {
+	setTestCacheDir(t)
+	ctx := context.Background()
+
+	ps := newHTTPTestPhotosService(t, "ss-test", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	})
+
+	// Pre-populate cached shared albums (normally set during discoverLibraries)
+	ps.sharedAlbums = []*SharedAlbum{
+		{AlbumGUID: "GUID-1", Name: "Vacation", Location: "https://example.com/tok1/sharedstreams/", SharingType: "owned", Ctag: "ctag-1"},
+		{AlbumGUID: "GUID-2", Name: "Family", Location: "https://example.com/tok2/sharedstreams/", SharingType: "subscribed", Ctag: "ctag-2"},
+	}
+
+	lib := &Library{service: ps, zoneID: "Shared Albums", kind: libraryKindSharedstreams, area: areaPrivate, albums: map[string]*Album{}}
+	albums, err := lib.GetAlbums(ctx)
+	require.NoError(t, err)
+	assert.Len(t, albums, 2)
+	assert.Contains(t, albums, "Vacation")
+	assert.Contains(t, albums, "Family")
+
+	vacation := albums["Vacation"]
+	assert.True(t, strings.HasPrefix(vacation.ObjectType, sharedstreamsAlbumPrefix))
+	assert.Contains(t, vacation.ObjectType, "GUID-1")
+	assert.Contains(t, vacation.ObjectType, "owned")
 }
 
 func TestAlbumCacheKey(t *testing.T) {
